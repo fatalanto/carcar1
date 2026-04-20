@@ -1,0 +1,257 @@
+#include <SPI.h>
+#include <MFRC522.h>
+
+// =====================
+// 感測器
+// =====================
+#define S1 A3
+#define S2 A4
+#define S3 A5
+#define S4 A6
+#define S5 A7
+
+// =====================
+// 馬達
+// =====================
+int PWMA = 10, AIN2 = 6, AIN1 = 7;
+int BIN1 = 8, BIN2 = 9, PWMB = 11;
+
+// PID
+int Tp = 135;
+double Kp = 40, Kd = 60, lastError = 0;
+int mid = 80;
+
+// =====================
+// RFID
+// =====================
+#define RST_PIN 49
+#define SS_PIN 53
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+
+// 🔥 防重複掃描
+String lastUID = "";
+unsigned long lastUIDTime = 0;
+
+// =====================
+// setup
+// =====================
+void setup() {
+
+  Serial.begin(9600);
+  Serial3.begin(9600);
+
+  pinMode(13, OUTPUT);
+
+  pinMode(S1, INPUT);
+  pinMode(S2, INPUT);
+  pinMode(S3, INPUT);
+  pinMode(S4, INPUT);
+  pinMode(S5, INPUT);
+
+  pinMode(PWMA, OUTPUT);
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+
+  SPI.begin();
+  mfrc522.PCD_Init();
+
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(13, HIGH);
+    delay(100);
+    digitalWrite(13, LOW);
+    delay(100);
+  }
+}
+
+// =====================
+// RFID
+// =====================
+void scanRFID() {
+
+  if (!mfrc522.PICC_IsNewCardPresent()) return;
+  if (!mfrc522.PICC_ReadCardSerial()) return;
+
+  String uid = "";
+
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    if (mfrc522.uid.uidByte[i] < 0x10) uid += "0";
+    uid += String(mfrc522.uid.uidByte[i], HEX);
+  }
+
+  uid.toUpperCase();
+
+  if (uid == lastUID && millis() - lastUIDTime < 1500) {
+    mfrc522.PICC_HaltA();
+    mfrc522.PCD_StopCrypto1();
+    return;
+  }
+
+  lastUID = uid;
+  lastUIDTime = millis();
+
+  Serial3.print("UID:" + uid + ",");
+
+  mfrc522.PICC_HaltA();
+  mfrc522.PCD_StopCrypto1();
+}
+
+// =====================
+// 馬達
+// =====================
+void MotorWriting(int vL, int vR) {
+
+  if (vL >= 0) {
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+    analogWrite(PWMA, constrain(vL, 0, 255));
+  } else {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+    analogWrite(PWMA, constrain(-vL, 0, 255));
+  }
+
+  if (vR >= 0) {
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+    analogWrite(PWMB, constrain(vR, 0, 255));
+  } else {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+    analogWrite(PWMB, constrain(-vR, 0, 255));
+  }
+}
+
+// =====================
+// 前進一格（只修 PID）
+// =====================
+void moveOneNode() {
+
+  MotorWriting(100, 100);
+  delay(40);
+
+  unsigned long t = millis();
+
+  while (true) {
+
+    scanRFID();
+
+    int s1 = analogRead(S1);
+    int s2 = analogRead(S2);
+    int s3 = analogRead(S3);
+    int s4 = analogRead(S4);
+    int s5 = analogRead(S5);
+
+    // ===== node 判定（不動）=====
+    if (s1 >= mid && s5 >= mid) {
+
+      scanRFID();
+
+      MotorWriting(130, 130);
+      delay(280);
+
+      MotorWriting(0, 0);
+      lastError = 0;
+      break;
+    }
+
+    // =========================
+    // ⭐ PID（已修正版）
+    // =========================
+    double sum = s1 + s2 + s3 + s4 + s5 + 1;
+
+    double e =
+      (-2.0 * s1 +
+       -1.0 * s2 +
+        0.0 * s3 +
+        1.0 * s4 +
+        2.0 * s5) / sum;
+
+    double pCorr = Kp * e + Kd * (e - lastError);
+
+    MotorWriting(Tp + pCorr, Tp - pCorr);
+    lastError = e;
+
+    if (millis() - t > 3000) {
+      MotorWriting(0, 0);
+      lastError = 0;
+      break;
+    }
+  }
+
+  lastError = 0;
+}
+
+// =====================
+// 轉彎（不動）
+// =====================
+void turnLeft90() {
+  MotorWriting(-120, 120);
+  delay(250);
+
+  while (analogRead(S3) < mid) {
+    MotorWriting(-80, 80);
+    scanRFID();
+  }
+
+  MotorWriting(0, 0);
+  lastError = 0;
+}
+
+void turnRight90() {
+  MotorWriting(120, -120);
+  delay(250);
+
+  while (analogRead(S3) < mid) {
+    MotorWriting(80, -80);
+    scanRFID();
+  }
+
+  MotorWriting(0, 0);
+  lastError = 0;
+}
+
+void turnAround() {
+  MotorWriting(130, -130);
+  delay(400);
+
+  while (analogRead(S3) < mid) {
+    MotorWriting(80, -80);
+    scanRFID();
+  }
+
+  MotorWriting(0, 0);
+  lastError = 0;
+}
+
+// =====================
+// 主迴圈（不動）
+// =====================
+void loop() {
+
+  scanRFID();
+
+  if (Serial3.available()) {
+
+    char cmd = Serial3.read();
+
+    if (cmd == 'W' || cmd == 'A' || cmd == 'D' || cmd == 'S') {
+
+      digitalWrite(13, HIGH);
+
+      if (cmd == 'W') moveOneNode();
+      else if (cmd == 'A') turnLeft90();
+      else if (cmd == 'D') turnRight90();
+      else if (cmd == 'S') turnAround();
+
+      while (Serial3.available()) Serial3.read();
+
+      Serial3.print('K');
+      digitalWrite(13, LOW);
+
+      delay(120);
+    }
+  }
+}
