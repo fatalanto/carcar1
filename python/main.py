@@ -23,34 +23,57 @@ SERVER_URL = "http://carcar.ntuee.org/scoreboard"
 
 BT_PORT = "COM6"
 BAUD_RATE = 9600
-MAZE_FILE = r"C:\Users\antho\OneDrive\桌面\carbfs\carcar1\midterm-project_2\python\big_maze_114.csv"
+MAZE_FILE = "big_maze_114.csv"  # 換成你的檔案路徑
 
-HANDSHAKE_WAIT = 2
+HANDSHAKE_WAIT = 5
 
-# ⭐ 賽事總時間 65 秒，保留 3 秒作為安全緩衝
-TIME_LIMIT = 62  
+# ⭐ 賽事真實總時間 65 秒
+TOTAL_MATCH_TIME = 65.0
+# ⭐ 演算法規劃時限 (保留 3 秒作為安全緩衝)
+TIME_LIMIT = 62.0  
 
 # =========================
-# 讀迷宮圖
+# 1. 讀取迷宮與實體距離權重 (防空白當機版)
 # =========================
 def load_graph(filename):
     graph = {}
+    weights = {}  # 紀錄兩點之間的實際距離 (ND, SD, WD, ED)
     with open(filename, "r", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            # 防呆：跳過完全空白的行
+            if not row.get("index") or not row["index"].strip():
+                continue
+                
             node = int(row["index"])
             g_node = {}
-            if row.get("North"): g_node["N"] = int(float(row["North"]))
-            if row.get("East"):  g_node["E"] = int(float(row["East"]))
-            if row.get("South"): g_node["S"] = int(float(row["South"]))
-            if row.get("West"):  g_node["W"] = int(float(row["West"]))
+            
+            # 安全解析函數：處理 CSV 裡的空白儲存格
+            def parse_edge(dir_key, dist_key, face):
+                val = row.get(dir_key)
+                if val and val.strip():  # 確認有連線
+                    nxt = int(float(val))
+                    g_node[face] = nxt
+                    
+                    # 讀取距離，如果 CSV 沒寫則預設為 3.0
+                    dist_val = row.get(dist_key)
+                    if dist_val and dist_val.strip():
+                        weights[(node, nxt)] = float(dist_val)
+                    else:
+                        weights[(node, nxt)] = 3.0 
+                        
+            parse_edge("North", "ND", "N")
+            parse_edge("South", "SD", "S")
+            parse_edge("West", "WD", "W")
+            parse_edge("East", "ED", "E")
+            
             graph[node] = g_node
-    return graph
+    return graph, weights
 
 # =========================
-# 建立座標系與計算曼哈頓分數
+# 2. 建立精準座標系與計算曼哈頓分數
 # =========================
-def build_coords_and_scores(graph, start_node):
+def build_coords_and_scores(graph, weights, start_node):
     coords = {start_node: (0, 0)}
     queue = [start_node]
     visited = {start_node}
@@ -60,20 +83,23 @@ def build_coords_and_scores(graph, start_node):
         cx, cy = coords[curr]
         for d, nxt in graph[curr].items():
             if nxt not in visited:
-                if d == 'N': coords[nxt] = (cx, cy + 1)
-                elif d == 'S': coords[nxt] = (cx, cy - 1)
-                elif d == 'E': coords[nxt] = (cx + 1, cy)
-                elif d == 'W': coords[nxt] = (cx - 1, cy)
+                # 根據 CSV 裡的 ND/SD/WD/ED 延伸正確的實體距離
+                dist = weights.get((curr, nxt), 3.0)
+                if d == 'N': coords[nxt] = (cx, cy + dist)
+                elif d == 'S': coords[nxt] = (cx, cy - dist)
+                elif d == 'E': coords[nxt] = (cx + dist, cy)
+                elif d == 'W': coords[nxt] = (cx - dist, cy)
                 visited.add(nxt)
                 queue.append(nxt)
 
     scores = {}
     for node, (x, y) in coords.items():
-        scores[node] = 10 * (abs(x) + abs(y))
+        # 分數 = 曼哈頓距離 * 10 (依照真實比例計算)
+        scores[node] = int(10 * (abs(x) + abs(y)))
     return scores
 
 # =========================
-# BFS 最短路徑搜尋 (點對點)
+# 3. BFS 最短路徑搜尋
 # =========================
 def bfs_shortest_path(graph, start, goal):
     queue = [[start]]
@@ -90,10 +116,13 @@ def bfs_shortest_path(graph, start, goal):
     return []
 
 # =========================
-# 計算路徑的真實物理耗時與最終朝向
+# 4. 動態計算物理時間與最終朝向 (適應不同長度路線)
 # =========================
-def calc_path_time_and_facing(graph, path, start_facing):
-    time_costs = {0: 0.765, 1: 1.17, 2: 0.955, 3: 1.17}
+def calc_path_time_and_facing(graph, weights, path, start_facing):
+    straight_time_base = 0.765
+    turn_time = 0.405
+    uturn_time = 0.190
+    
     comp = ["N", "E", "S", "W"]
     total_t = 0.0
     curr_f = start_facing
@@ -101,30 +130,39 @@ def calc_path_time_and_facing(graph, path, start_facing):
     for i in range(len(path) - 1):
         curr = path[i]
         nxt = path[i + 1]
+        
+        # 取得這段路的真實長度比例
+        dist = weights.get((curr, nxt), 3.0)
+        dist_ratio = dist / 3.0
+        
         for d, n in graph[curr].items():
             if n == nxt:
                 diff = (comp.index(d) - comp.index(curr_f)) % 4
-                total_t += time_costs[diff]
+                
+                # 計算動態耗時：動作時間 + (直走時間 * 距離比例)
+                if diff == 0:
+                    total_t += straight_time_base * dist_ratio
+                elif diff == 1 or diff == 3:
+                    total_t += turn_time + (straight_time_base * dist_ratio)
+                elif diff == 2:
+                    total_t += uturn_time + (straight_time_base * dist_ratio)
+                    
                 curr_f = d
                 break
     return total_t, curr_f
 
 # =========================
-# ⭐ 智慧型指定打擊演算法 (保底回收貪婪策略)
+# 5. ⭐ 智慧型指定打擊演算法 (保底回收貪婪策略)
 # =========================
-def get_smart_greedy_path(graph, start_node, start_facing, time_limit):
-    scores = build_coords_and_scores(graph, start_node)
+def get_smart_greedy_path(graph, weights, start_node, start_facing, time_limit):
+    scores = build_coords_and_scores(graph, weights, start_node)
     
-    # 1. 找出所有寶藏點 (地圖上的死胡同，且排除起點)
     treasures = [n for n, edges in graph.items() if len(edges) == 1 and n != start_node]
-    
-    # 2. 依分數由低到高排序
     treasures.sort(key=lambda n: scores[n])
     
-    # 3. 戰術核心：扣除分數最低(最近)的兩個，放到最後走
     if len(treasures) >= 2:
-        reserved_treasures = treasures[:2]   # 保底目標 (最後回收)
-        active_treasures = treasures[2:]     # 優先進攻目標 (向外衝刺)
+        reserved_treasures = treasures[:2]   
+        active_treasures = treasures[2:]     
     else:
         reserved_treasures = []
         active_treasures = treasures
@@ -134,14 +172,13 @@ def get_smart_greedy_path(graph, start_node, start_facing, time_limit):
     curr_facing = start_facing
     current_time = 0.0
     
-    log.info(f"🗺️ 地圖掃描完畢，共發現 {len(treasures)} 個寶藏點 (死胡同)")
-    log.info(f"🛡️ 戰術啟動：保留最後走的 2 個低分寶藏點為 -> {reserved_treasures}")
-    log.info(f"⚔️ 優先進攻目標為 -> {active_treasures}")
+    log.info(f"🗺️ 掃描完畢，發現 {len(treasures)} 個死胡同寶藏點")
+    log.info(f"🛡️ 戰術啟動：保留 2 個低分寶藏為 -> {reserved_treasures}")
+    log.info(f"⚔️ 優先進攻高分目標 -> {active_treasures}")
     
-    # 4. 先走 active (優先目標)，再走 reserved (保底目標)
     for phase, target_group in enumerate([active_treasures, reserved_treasures]):
         if phase == 1:
-            log.info("🔔 優先目標已清空或超時，開始回收最後的保底寶藏！")
+            log.info("🔔 開始回收最後的保底寶藏！")
             
         while target_group:
             best_target = None
@@ -151,15 +188,14 @@ def get_smart_greedy_path(graph, start_node, start_facing, time_limit):
             best_time_cost = 0
             best_final_facing = curr_facing
             
-            # 評估群組內每一個寶藏點
             for t in target_group:
                 p = bfs_shortest_path(graph, curr_node, t)
                 if not p: continue
                 
-                dist = len(p) - 1  # 距離 (經過幾個節點)
-                t_cost, f_facing = calc_path_time_and_facing(graph, p, curr_facing)
+                dist = len(p) - 1 
+                t_cost, f_facing = calc_path_time_and_facing(graph, weights, p, curr_facing)
                 
-                # 戰術邏輯：越近越先走 -> 如果一樣近，先走分數高的
+                # 戰術：越近越先走 -> 一樣近挑高分的
                 if dist < best_dist:
                     best_dist = dist
                     best_score = scores[t]
@@ -178,15 +214,13 @@ def get_smart_greedy_path(graph, start_node, start_facing, time_limit):
             if best_target is None:
                 break
                 
-            # 檢查加上走到目標的時間後，是否會超過比賽總時限
             if current_time + best_time_cost > time_limit:
-                log.info(f"⏳ 剩餘時間不足以走到寶藏 {best_target}，放棄此目標！")
-                target_group.remove(best_target) # 這個點走不到，剔除它，試試看有沒有更近的
+                log.info(f"⏳ 剩餘時間不足走到寶藏 {best_target}，放棄目標！")
+                target_group.remove(best_target) 
                 continue
                 
-            # 確定目標，正式加入路徑
             target_group.remove(best_target)
-            full_path.extend(best_path_to_target[1:]) # 避開重複加入當前節點
+            full_path.extend(best_path_to_target[1:]) 
             curr_node = best_target
             curr_facing = best_final_facing
             current_time += best_time_cost
@@ -197,7 +231,7 @@ def get_smart_greedy_path(graph, start_node, start_facing, time_limit):
     return full_path
 
 # =========================
-# 路徑轉指令
+# 6. 路徑轉指令
 # =========================
 def get_actions(graph, path, start_facing):
     actions = []
@@ -218,65 +252,63 @@ def get_actions(graph, path, start_facing):
     return actions
 
 # =========================
-# 滑動視窗指令派發器
+# 7. ⭐ 一次性批次傳輸 (全速無縫接軌版)
 # =========================
-def execute_commands_with_window(ser, point, action_seq):
-    MAX_WINDOW = 3 
-    in_flight = 0   
-    cmd_idx = 0     
-    total_cmds = len(action_seq)
+def execute_all_at_once(ser, point, action_seq):
+    # 將陣列合併成一條超長字串
+    full_cmd_string = "".join(action_seq)
+    total_cmds = len(full_cmd_string)
+    
+    log.info(f"🚀 一次性發送完整劇本給車子: [{full_cmd_string}] (共 {total_cmds} 步)")
+    
+    # 一口氣全部傳輸給車子
+    ser.write((full_cmd_string + "\n").encode("utf-8"))
+    ser.flush()
 
-    log.info("🚀 開始發送指令 (啟用 3 格緩衝區)...")
-
-    while in_flight < MAX_WINDOW and cmd_idx < total_cmds:
-        cmd = action_seq[cmd_idx]
-        ser.write((cmd + "\n").encode("utf-8"))
-        ser.flush()
-        in_flight += 1
-        cmd_idx += 1
-
+    match_start_time = time.time()
     buffer = ""
-    last_receive_time = time.time()
+    
+    log.info("🎧 指令發送完畢！切換為全職監聽模式，等待 UID 上傳...")
 
-    while in_flight > 0:
+    while True:
         if ser.in_waiting > 0:
             data = ser.read(ser.in_waiting).decode("utf-8", errors="ignore")
             print(data, end="") 
             buffer += data
-            last_receive_time = time.time()  
 
+            # ===== 攔截並上傳 UID =====
             while True:
                 match = re.search(r"UID:([0-9A-F]+)", buffer)
                 if not match: break
                 uid = match.group(1)
-                log.info(f"\n💳 UID: {uid}，正在上傳...")
+                
+                # ⭐ 計算並顯示比賽剩餘時間
+                elapsed = time.time() - match_start_time
+                remaining = max(0.0, TOTAL_MATCH_TIME - elapsed)
+                
+                log.info(f"\n💳 UID: {uid}，正在上傳... (⏱️ 比賽剩餘: {remaining:.2f}s)")
                 try:
                     point.add_UID(uid)
                 except Exception as e:
                     log.warning(f"⚠️ UID 上傳失敗: {e}")
+                    
                 buffer = buffer.replace(match.group(0), "", 1)
 
-            while "K" in buffer:
-                buffer = buffer.replace("K", "", 1)
-                in_flight -= 1  
+            # ===== 攔截完賽廣播 DONE =====
+            if "DONE" in buffer:
+                final_elapsed = time.time() - match_start_time
+                log.info(f"\n🏁 車子回報：全線跑完！總實際耗時: {final_elapsed:.2f}s")
+                break
 
-                if cmd_idx < total_cmds:
-                    cmd = action_seq[cmd_idx]
-                    ser.write((cmd + "\n").encode("utf-8"))
-                    ser.flush()
-                    in_flight += 1
-                    cmd_idx += 1
-                else:
-                    log.info(f"✅ 車子完成動作 (剩餘最後 {in_flight} 步收尾)")
-
-        if time.time() - last_receive_time > 8.0:
-            log.error("\n❌ 車子超過 8 秒無回應 (Timeout)，可能卡住了！")
+        # Timeout 保護機制
+        if time.time() - match_start_time > (TOTAL_MATCH_TIME + 5.0):
+            log.error(f"\n❌ 超過 {TOTAL_MATCH_TIME + 5.0} 秒車子無回應 (Timeout)，強制結束監聽！")
             break
 
         time.sleep(0.01)
 
 # =========================
-# 主程式
+# 8. 主程式
 # =========================
 def main():
     parser = argparse.ArgumentParser()
@@ -290,20 +322,17 @@ def main():
         log.error(f"❌ 網路連線失敗: {e}")
 
     try:
-        graph = load_graph(MAZE_FILE)
+        graph, weights = load_graph(MAZE_FILE)
     except Exception as e:
         log.error(f"❌ 迷宮檔讀取失敗: {e}")
         return
 
     try:
-        start_node = 25
+        start_node = 25 
         log.info(f"📍 固定起點編號: {start_node}")
         
-        # =========================================
         # 自動判斷初始朝向
-        # =========================================
         possible_exits = list(graph[start_node].keys())
-        
         if len(possible_exits) == 1:
             start_facing = possible_exits[0]
             log.info(f"🧭 偵測到起點為死胡同，自動設定初始朝向: {start_facing}")
@@ -316,8 +345,8 @@ def main():
         log.error(f"❌ 初始化設定錯誤: {e}")
         return
 
-    # ⭐ 套用你專屬設計的戰術演算法
-    path = get_smart_greedy_path(graph, start_node, start_facing, TIME_LIMIT)
+    # 執行戰術演算法
+    path = get_smart_greedy_path(graph, weights, start_node, start_facing, TIME_LIMIT)
     action_seq = get_actions(graph, path, start_facing)
 
     log.info(f"🛣️ 戰術節點路徑: {path}")
@@ -335,7 +364,8 @@ def main():
         return
 
     try:
-        execute_commands_with_window(ser, point, action_seq)
+        # ⭐ 改用一次性批次傳輸函式
+        execute_all_at_once(ser, point, action_seq)
         log.info("🏁 任務結束，完美抵達終點！")
     except KeyboardInterrupt:
         log.warning("⛔ 使用者中止")
